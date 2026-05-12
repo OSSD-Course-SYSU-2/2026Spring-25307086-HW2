@@ -1,19 +1,6 @@
 {
   "app": {
     "signingConfigs": [
-      {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": {
-          "certpath": "C:\\Users\\Lenovo\\.ohos\\config\\default_SYSU-Food-Picker_sP2orzazIRWvmAmzjrSxSa5PBgvYlGHo0xhIOSAWTD0=.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "0000001B66BEBB106F22A51D14ABECDF8CD390281DE23BED4B83EF151A76B00FA3839DE9B67D34B175A31D",
-          "profile": "C:\\Users\\Lenovo\\.ohos\\config\\default_SYSU-Food-Picker_sP2orzazIRWvmAmzjrSxSa5PBgvYlGHo0xhIOSAWTD0=.p7b",
-          "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\Lenovo\\.ohos\\config\\default_SYSU-Food-Picker_sP2orzazIRWvmAmzjrSxSa5PBgvYlGHo0xhIOSAWTD0=.p12",
-          "storePassword": "0000001B9D5A9BE5067CC45282EE577263055571E2AED47F7D6B97C55AC6E734A7380DEF225CBAFD46257D"
-        }
-      }
     ],
     "products": [
       {
