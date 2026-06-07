@@ -2,15 +2,7 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
-    },
-    {
-      "name": "EntryAbility_desc",
-      "value": "description"
-    },
-    {
-      "name": "EntryAbility_label",
-      "value": "label"
+      "value": "康乐园干饭助手手表版"
     },
     {
       "name": "permission_internet_reason",
@@ -19,6 +11,14 @@
     {
       "name": "permission_location_reason",
       "value": "计算餐厅距离"
+    },
+    {
+      "name": "WearableAbility_desc",
+      "value": "Wearable ability description"
+    },
+    {
+      "name": "WearableAbility_label",
+      "value": "Wearable"
     }
   ]
 }
