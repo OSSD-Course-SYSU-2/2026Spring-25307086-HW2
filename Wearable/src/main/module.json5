@@ -1,0 +1,36 @@
+{
+  "module": {
+    "name": "Wearable",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "WearableAbility",
+    "deviceTypes": [
+      "wearable"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "WearableAbility",
+        "srcEntry": "./ets/wearableability/WearableAbility.ets",
+        "description": "$string:WearableAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:WearableAbility_label",
+        "startWindowIcon": "$media:layered_image",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "actions": [
+              "action.system.home"
+            ],
+            "entities": [
+              "entity.system.home"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
