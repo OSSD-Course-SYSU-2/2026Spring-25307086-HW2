@@ -2,7 +2,21 @@ import { curves, promptAction } from '@kit.ArkUI';
 import { http } from '@kit.NetworkKit';
 import { geoLocationManager } from '@kit.LocationKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
+// ✅ 自由流转功能新增：分布式键值数据库，用于把打卡记录同步到同账号下的其他设备
+import { distributedKVStore } from '@kit.ArkData';
+// 1. 历史记录的数据格式定义
+// 历史记录的数据格式定义（必须放在 @Entry 的外面！）
+export interface CheckInRecord {
+  id: string;
+  shopName: string;
+  date: number;
+  waitTime: number; // 等待时间 (分钟)
+  cost: number;     // 消费金额 (元)
+  shopType?: string; // ✅ 月度报告功能新增：打卡时的店铺类型，用于"按类型分布"统计（旧记录可能没有此字段）
+}
 
+// 2. 持久化数据引擎注册（这行保证关掉App后记录不丢失）
+PersistentStorage.persistProp('checkInRecords', []);
 interface Shop {
   name: string;
   type: string;
@@ -43,6 +57,21 @@ interface CampusBuilding {
   lng: number;
 }
 
+// ✅ 月度报告功能新增：单月汇总数据结构
+interface MonthSummary {
+  count: number;
+  totalCost: number;
+  avgWait: number;
+  topShop: string;
+  topShopCount: number;
+}
+
+// ✅ 月度报告功能新增：按店铺类型统计花费分布的数据结构
+interface TypeBreakdownItem {
+  type: string;
+  cost: number;
+}
+
 const campusMapNodes: CampusBuilding[] = [
   { name: '📡 实时 GPS 定位', lat: 0, lng: 0 },
   { name: '🏢 第一教学楼 ', lat: 23.093200, lng: 113.294100 },
@@ -64,15 +93,43 @@ const fallbackImages: string[] = [
 function getRandomBg(): string {
   return fallbackImages[Math.floor(Math.random() * fallbackImages.length)];
 }
-// 💡 全新配置：食欲唤醒渐变色引擎
+// ✅ 打卡功能新增：生成 0~max 的字符串数字数组，供滑动选择器弹窗（TextPickerDialog）的 range 使用
+function buildNumberRange(max: number): string[] {
+  let result: string[] = [];
+  for (let i = 0; i <= max; i++) {
+    result.push(i.toString());
+  }
+  return result;
+}
+// 💡 全新配置：食欲唤醒渐变色引擎（按店铺类型区分色调，呼应"全新配置"的初衷，同时修掉 type 参数未使用的警告）
 function getWarmGradient(type: string): [ResourceColor, number][] {
-
+  if (type === '点外卖') {
+    return [
+      ['#F5222D', 0.0],
+      ['#FF7A45', 0.5],
+      ['#FFA940', 1.0]
+    ];
+  }
+  if (type === '吃泡面') {
+    return [
+      ['#D4380D', 0.0],
+      ['#FA8C16', 0.5],
+      ['#FFC53D', 1.0]
+    ];
+  }
+  if (type === '出去吃') {
+    return [
+      ['#C41D7F', 0.0],
+      ['#FF7A45', 0.5],
+      ['#FFD666', 1.0]
+    ];
+  }
+  // 默认（吃食堂等其他类型）
   return [
     ['#FF4D4F', 0.0],   // 红色
     ['#FF7A45', 0.5],   // 橙色
     ['#FFD666', 1.0]    // 黄色
   ];
-
 }
 const defaultShops: Shop[] = [
   { name: '松涛园一楼自选', type: '吃食堂', level: '夯', score: 5, busyLevel: 2, avgCost: 15, history: [10, 15], bgImg: fallbackImages[0], lat: 23.096500, lng: 113.291200 },
@@ -125,16 +182,18 @@ const defaultShops: Shop[] = [
 // 1. 修改这一行的 Key 改为 V13
 PersistentStorage.persistProp('MyShopsMagazine_V13_MapSensors', JSON.stringify(defaultShops));
 
+// 绑定持久化数据数组
 
 @Entry
 @Component
 struct Index {
+  @State selectedShop: Shop | null = null;
   @State resultText: string = '饥饿感知系统';
   @State resultSubText: string = '正在连接数字空间矩阵...';
   @State resultCategory: string = '';
   @State isRolling: boolean = false;
   @State textScale: number = 1.0;
-  @State weatherIcon: string = '📡 探测中'; // 新增专门负责图标的变量
+  @State weatherIcon: string = '🌤️ 晴朗'; // 新增专门负责图标的变量
   @State currentPreference: number = 0;
   @State isRainy: boolean = false;
   @State weatherDescription: string = '正在获取同步天候...';
@@ -146,6 +205,25 @@ struct Index {
   @State predictedTotalTime: number = 0;
   @State showReroll: boolean = false;
   @State lastWaitTimeRecord: number = 999;
+
+  // ✅ 打卡功能新增：实际等待时间 / 实际花费的输入框状态（抽中结果后会自动预填预测值，用户可手动校准）
+  @State checkInWaitInput: string = '';
+  @State checkInCostInput: string = '';
+
+  // ✅ 新增：抽出结果时，下方结果卡片的入场偏移量（配合弹簧动画做"下移归位"效果）
+  @State resultCardOffsetY: number = 0;
+
+  // ✅ 动态布局新增：仪表盘区 / 美食图鉴区的弹性比例权重，随内容多少自动伸缩
+  // 默认 5:6 让图鉴区更大（方便浏览）；有结果/展开预算时仪表盘按需扩张
+  @State topPanelWeight: number = 5;
+  @State bottomPanelWeight: number = 6;
+
+  // ✅ 月度报告功能新增：当前查看的报告年份/月份，默认是本月
+  @State reportYear: number = new Date().getFullYear();
+  @State reportMonth: number = new Date().getMonth() + 1;
+
+  // ✅ 自由流转功能新增：跨设备同步的状态文案，给用户一个直观的连接提示
+  @State syncStatus: string = '⚪ 正在连接跨设备同步…';
 
   @State displayImage: string = getRandomBg();
 
@@ -170,6 +248,35 @@ struct Index {
   @State inputBusyLevel: number = 2;
 
   private apiKey: string = '2d471aecb46e469ba8a0a68c75a31ada';
+  // ✅ 打卡功能新增：用于从首页“打卡记录”入口直接跳转到 FormSheet 里新增的历史记录标签页
+  private formTabsController: TabsController = new TabsController();
+  // ✅ 打卡功能新增：等待时间(0~180分钟) / 花费(0~300元) 的可选范围，供滑动选择器弹窗使用
+  private waitTimeOptions: string[] = buildNumberRange(180);
+  private costOptions: string[] = buildNumberRange(300);
+  // ✅ 自由流转功能新增：分布式键值数据库实例 + 固定的数据库 ID（同一应用、同账号的设备会共用这个库）
+  private kvManager?: distributedKVStore.KVManager;
+  private kvStore?: distributedKVStore.SingleKVStore;
+  private readonly distributedStoreId: string = 'shilihua_checkin_store';
+
+  // ✅ 动态布局新增：根据"有无结果"+"预算是否展开"，动态计算两个区域的弹性比例权重
+  // 设计逻辑：
+  //   默认（无结果，预算收起）→ 5:6，图鉴区更大，方便浏览
+  //   有结果 OR 预算展开    → 6:5，两区均衡
+  //   有结果 AND 预算展开   → 8:3，仪表盘优先，确保打卡区/偏好按钮/开始决定都完整露出
+  updatePanelWeights(): void {
+    let hasResult = this.predictedTotalTime > 0;
+    let budgetOpen = this.isBudgetExpanded;
+    if (hasResult && budgetOpen) {
+      this.topPanelWeight = 8;
+      this.bottomPanelWeight = 3;
+    } else if (hasResult || budgetOpen) {
+      this.topPanelWeight = 6;
+      this.bottomPanelWeight = 5;
+    } else {
+      this.topPanelWeight = 5;
+      this.bottomPanelWeight = 6;
+    }
+  }
 
   formatDistance(meters: number): string {
     return meters < 1000 ? `${meters}米` : `${(meters / 1000).toFixed(1)}公里`;
@@ -200,6 +307,8 @@ struct Index {
       }
     }
     setTimeout(() => { this.fetchEnvironmentData(); }, 500);
+    // ✅ 自由流转功能新增：异步初始化跨设备同步，失败也不影响本机打卡功能正常使用
+    this.initDistributedSync();
   }
 
   calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
@@ -374,8 +483,20 @@ struct Index {
         this.predictedQueueTime = finalQueueTime; this.predictedWalkTime = finalWalkTime; this.predictedTotalTime = newTotalTime;
         if (this.predictedTotalTime > 30) { this.showReroll = true; }
 
+        // ✅ 打卡功能新增：记录本次抽中的店铺，并把预测值预填进打卡输入框，方便用户直接确认或手动修正
+        this.selectedShop = bestShop;
+        this.checkInWaitInput = this.predictedTotalTime.toString();
+        this.checkInCostInput = bestShop.avgCost.toString();
+
+        // ✅ 新增：先把卡片放到上方一点，紧接着用弹簧动画下移归位，做出"抽出结果时卡片下移落定"的效果
+        this.resultCardOffsetY = -16;
+
         this.isRolling = false;
-        this.getUIContext().animateTo({ curve: curves.springMotion() }, () => { this.textScale = 1.1; });
+        this.getUIContext().animateTo({ curve: curves.springMotion() }, () => {
+          this.textScale = 1.1;
+          this.resultCardOffsetY = 0;
+          this.updatePanelWeights(); // ✅ 动态布局新增：结果落地时同步扩大仪表盘区
+        });
         setTimeout(() => { this.textScale = 1.0; }, 300);
       }
     }, 100);
@@ -461,6 +582,14 @@ struct Index {
             .fontSize(12).fontColor(Color.White).fontWeight(FontWeight.Bold)
           Text('|').fontColor('rgba(255,255,255,0.3)')
           Text(`实时天候: ${this.weatherDescription}`).fontSize(12).fontColor(Color.White)
+          Blank()
+          // ✅ 打卡功能新增：点击直接打开表单弹窗并跳转到“打卡记录”标签页
+          Text(`📋 打卡记录(${this.checkInRecords.length})`)
+            .fontSize(12).fontColor(Color.White).fontWeight(FontWeight.Medium)
+            .onClick(() => {
+              this.isShowSheet = true;
+              setTimeout(() => { this.formTabsController.changeIndex(2); }, 100);
+            })
         }
         Blank()
 
@@ -487,14 +616,56 @@ struct Index {
               }
               Text(`预计总耗时: ${this.predictedTotalTime} 分钟`).fontSize(15).fontColor(this.predictedTotalTime > 30 ? '#FF5252' : '#00E676').fontWeight(FontWeight.Bold)
               if (this.showReroll) { Button('耗时太久，重新选择').height(28).fontSize(12).backgroundColor('#D32F2F').fontColor(Color.White).margin({ top: 5 }).onClick(() => { this.rollFood(); }) }
+
+              // ✅ 打卡功能新增：等待时间 / 花费改成"像闹钟一样上下滑动"的选择器弹窗，而不是手敲键盘
+              if (this.selectedShop) {
+                Row({ space: 4 }) {
+                  Text('⏱').fontSize(12).fontColor('rgba(255,255,255,0.7)')
+                  Text(`${this.checkInWaitInput} 分`)
+                    .layoutWeight(1).height(26).fontSize(11).fontColor(Color.White).textAlign(TextAlign.Center)
+                    .backgroundColor('rgba(255,255,255,0.15)').borderRadius(6)
+                    .onClick(() => {
+                      let idx = Number(this.checkInWaitInput);
+                      this.getUIContext().showTextPickerDialog({
+                        range: this.waitTimeOptions,
+                        selected: (!isNaN(idx) && idx >= 0 && idx <= 180) ? idx : 0,
+                        onAccept: (value: TextPickerResult) => { this.checkInWaitInput = value.value as string; }
+                      });
+                    })
+                  Text('💰').fontSize(12).fontColor('rgba(255,255,255,0.7)').margin({ left: 6 })
+                  Text(`¥${this.checkInCostInput}`)
+                    .layoutWeight(1).height(26).fontSize(11).fontColor(Color.White).textAlign(TextAlign.Center)
+                    .backgroundColor('rgba(255,255,255,0.15)').borderRadius(6)
+                    .onClick(() => {
+                      let idx = Number(this.checkInCostInput);
+                      this.getUIContext().showTextPickerDialog({
+                        range: this.costOptions,
+                        selected: (!isNaN(idx) && idx >= 0 && idx <= 300) ? idx : 0,
+                        onAccept: (value: TextPickerResult) => { this.checkInCostInput = value.value as string; }
+                      });
+                    })
+                  Button('📌 打卡')
+                    .height(26).fontSize(11).fontWeight(FontWeight.Bold).margin({ left: 6 })
+                    .backgroundColor('#00C853').fontColor(Color.White).borderRadius(13)
+                    .onClick(() => {
+                      let finalWait = Number(this.checkInWaitInput);
+                      let finalCost = Number(this.checkInCostInput);
+                      this.saveCheckIn(
+                        isNaN(finalWait) ? this.predictedTotalTime : finalWait,
+                        isNaN(finalCost) ? (this.selectedShop ? this.selectedShop.avgCost : 0) : finalCost
+                      );
+                    })
+                }.width('100%').margin({ top: 4 })
+              }
             }.margin({ top: 5 }).padding(10).backgroundColor('rgba(0,0,0,0.4)').borderRadius(12)
+            .translate({ y: this.resultCardOffsetY })
           }
         }
         Blank()
 
         Column({ space: 10 }) {
           Text(this.isBudgetExpanded ? '收起预算设定 ▲' : '展开预算设定 ▼').fontSize(12).fontColor('rgba(255,255,255,0.6)')
-            .onClick(() => { this.getUIContext().animateTo({ curve: curves.springMotion() }, () => { this.isBudgetExpanded = !this.isBudgetExpanded; }); })
+            .onClick(() => { this.getUIContext().animateTo({ curve: curves.springMotion() }, () => { this.isBudgetExpanded = !this.isBudgetExpanded; this.updatePanelWeights(); }); })
           if (this.isBudgetExpanded) {
             Row() { Text('预算上限').fontSize(12).fontColor('rgba(255,255,255,0.8)'); Blank(); Text(`￥${this.currentBudget}`).fontSize(20).fontColor(Color.White).fontWeight(FontWeight.Bold) }.width('85%')
             Slider({ value: this.currentBudget, min: 10, max: 200, step: 5, style: SliderStyle.OutSet }).onChange((v: number) => { this.currentBudget = Math.floor(v); }).width('90%').selectedColor(Color.White).trackColor('rgba(255,255,255,0.2)')
@@ -511,7 +682,7 @@ struct Index {
         Button(this.isRolling ? '算法运算中...' : '开始决定')
           .width('75%').height(42).fontSize(15).fontWeight(FontWeight.Bold).backgroundColor(this.isRolling ? 'rgba(255,255,255,0.2)' : Color.White)
           .fontColor(this.isRolling ? Color.White : Color.Black).borderRadius(21).onClick(() => { this.rollFood(); })
-      }.width('100%').height('100%').padding({ left: 10, right: 10, top: 15, bottom: 15 })
+      }.width('100%').height('100%').padding({ left: 10, right: 10, top: 12, bottom: 12 })
     }.width('100%').height('100%')
   }
 
@@ -553,7 +724,7 @@ struct Index {
   syncDataToStorage(): void { this.shopsJson = JSON.stringify(this.shops); }
 
   @Builder FormSheet() {
-    Tabs() {
+    Tabs({ controller: this.formTabsController }) {
       TabContent() {
         Column({ space: 15 }) {
           Text('时空矩阵批量导入').fontSize(16).fontWeight(FontWeight.Bold).width('100%')
@@ -571,7 +742,7 @@ struct Index {
 
           Row({ space: 10 }) {
             TextInput({ placeholder: '人均消费 (￥)', text: this.inputCost }).type(InputType.Number).layoutWeight(1).onChange((v: string) => this.inputCost = v).backgroundColor('#F5F7FA').borderRadius(8)
-            Select([{ value: '吃食堂' }, { value: '点外卖' }, { value: '出去吃' }, { value: '吃泡面' }]).value(this.inputType).onSelect((index: number, value: string) => this.inputType = value).layoutWeight(1).borderRadius(8)
+            Select([{ value: '吃食堂' }, { value: '点外卖' }, { value: '出去吃' }, { value: '吃泡面' }]).value(this.inputType).onSelect((_index: number, value: string) => this.inputType = value).layoutWeight(1).borderRadius(8)
           }
 
           Row({ space: 10 }) {
@@ -603,10 +774,462 @@ struct Index {
             })
         }.padding(20)
       }.tabBar('精细录入')
+
+      // ✅ 打卡功能新增：第三个标签页，展示历史打卡记录
+      TabContent() {
+        Column({ space: 12 }) {
+          Row() {
+            Text(`📋 打卡记录 (共 ${this.checkInRecords.length} 次)`).fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333').layoutWeight(1)
+            if (this.checkInRecords.length > 0) {
+              Text('清空').fontSize(12).fontColor('#D32F2F').onClick(() => { this.clearCheckInRecords(); })
+            }
+          }.width('100%')
+
+          // ✅ 自由流转功能新增：跨设备同步状态提示，失败时可以点一下"重试"
+          Row({ space: 8 }) {
+            Text(this.syncStatus).fontSize(11).fontColor('#999').layoutWeight(1)
+            if (this.syncStatus.indexOf('未开启') >= 0) {
+              Text('重试').fontSize(11).fontColor('#007AFF').onClick(() => { this.initDistributedSync(); })
+            }
+          }.width('100%')
+
+          if (this.checkInRecords.length === 0) {
+            Column({ space: 6 }) {
+              Text('暂无打卡记录').fontSize(14).fontColor('#999')
+              Text('在首页点"开始决定"抽中店铺后，下方会出现"确认打卡"按钮').fontSize(12).fontColor('#BBB').textAlign(TextAlign.Center)
+            }.width('100%').padding({ top: 40 })
+          } else {
+            List({ space: 10 }) {
+              ForEach(this.checkInRecords.slice().reverse(), (record: CheckInRecord) => {
+                ListItem() {
+                  Row() {
+                    Column({ space: 4 }) {
+                      Text(record.shopName).fontSize(14).fontWeight(FontWeight.Bold).fontColor('#222').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Text(new Date(record.date).toLocaleString()).fontSize(11).fontColor('#999')
+                    }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                    Column({ space: 4 }) {
+                      Text(`￥${record.cost}`).fontSize(13).fontColor('#FF7A45').fontWeight(FontWeight.Bold)
+                      Text(`${record.waitTime} 分钟`).fontSize(11).fontColor('#666')
+                    }.alignItems(HorizontalAlign.End)
+                    Text('✕').fontSize(14).fontColor('#CCC').padding(6).onClick(() => { this.deleteCheckInRecord(record.id); })
+                  }.width('100%').padding(12).backgroundColor('#F8F8FA').borderRadius(10)
+                }
+              }, (record: CheckInRecord) => record.id)
+            }.width('100%').height('100%').layoutWeight(1)
+          }
+        }.padding(20).width('100%').height('100%')
+      }.tabBar('打卡记录')
+
+      // ✅ 月度报告功能新增：第四个标签页，按月汇总打卡数据（内容较多，用 Scroll 包裹，避免被裁切）
+      TabContent() {
+        Scroll() {
+          Column({ space: 14 }) {
+            // 月份切换
+            Row() {
+              Text('‹').fontSize(20).fontColor('#666').fontWeight(FontWeight.Bold).padding(8)
+                .onClick(() => { this.shiftReportMonth(-1); })
+              Text(`${this.reportYear}年${this.reportMonth}月`).fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333').layoutWeight(1).textAlign(TextAlign.Center)
+              Text('›').fontSize(20).fontColor(this.isCurrentOrFutureMonth() ? '#DDD' : '#666').fontWeight(FontWeight.Bold).padding(8)
+                .onClick(() => { if (!this.isCurrentOrFutureMonth()) { this.shiftReportMonth(1); } })
+            }.width('100%')
+
+            // ✅ 丰富月度报告：统计格改成 2x2，多展示一个"均消费"指标
+            Row({ space: 10 }) {
+              Column({ space: 4 }) {
+                Text(`${this.getMonthSummary().count}`).fontSize(20).fontWeight(FontWeight.Bold).fontColor('#FF7A45')
+                Text('打卡次数').fontSize(11).fontColor('#999')
+              }.layoutWeight(1).padding(10).backgroundColor('#F8F8FA').borderRadius(10)
+              Column({ space: 4 }) {
+                Text(`¥${this.getMonthSummary().totalCost}`).fontSize(20).fontWeight(FontWeight.Bold).fontColor('#FF7A45')
+                Text('总花费').fontSize(11).fontColor('#999')
+              }.layoutWeight(1).padding(10).backgroundColor('#F8F8FA').borderRadius(10)
+            }.width('100%')
+            Row({ space: 10 }) {
+              Column({ space: 4 }) {
+                Text(`¥${this.getMonthSummary().count > 0 ? Math.round(this.getMonthSummary().totalCost / this.getMonthSummary().count) : 0}`).fontSize(20).fontWeight(FontWeight.Bold).fontColor('#FF7A45')
+                Text('均消费(每次)').fontSize(11).fontColor('#999')
+              }.layoutWeight(1).padding(10).backgroundColor('#F8F8FA').borderRadius(10)
+              Column({ space: 4 }) {
+                Text(`${this.getMonthSummary().avgWait}`).fontSize(20).fontWeight(FontWeight.Bold).fontColor('#FF7A45')
+                Text('均耗时(分)').fontSize(11).fontColor('#999')
+              }.layoutWeight(1).padding(10).backgroundColor('#F8F8FA').borderRadius(10)
+            }.width('100%')
+
+            if (this.getMonthSummary().count > 0) {
+              // ✅ 丰富月度报告：环比上月
+              Text(this.getMonthOverMonthText()).fontSize(11).fontColor('#999').width('100%')
+
+              // 本月最常去的店铺
+              Row({ space: 8 }) {
+                Text('🏆').fontSize(16)
+                Text(`本月最常去：${this.getMonthSummary().topShop}（${this.getMonthSummary().topShopCount} 次）`).fontSize(13).fontColor('#333').layoutWeight(1)
+              }.width('100%').padding(12).backgroundColor('#FFF6EC').borderRadius(10)
+
+              // ✅ 丰富月度报告：单次最高消费
+              Row({ space: 8 }) {
+                Text('🔥').fontSize(16)
+                Text(`单次最高消费：${this.getMaxSingleCostShopName()} ¥${this.getMaxSingleCost()}`).fontSize(13).fontColor('#333').layoutWeight(1)
+              }.width('100%').padding(12).backgroundColor('#FFF0F0').borderRadius(10)
+
+              // ✅ 丰富月度报告：按店铺类型的花费分布（分段条形图 + 图例）
+              Column({ space: 8 }) {
+                Text('按类型分布').fontSize(12).fontColor('#999').width('100%')
+                Row() {
+                  ForEach(this.getTypeBreakdown(), (item: TypeBreakdownItem, idx: number) => {
+                    Column().layoutWeight(item.cost > 0 ? item.cost : 1).height(14).backgroundColor(this.getTypeColor(idx))
+                  }, (item: TypeBreakdownItem, _idx: number) => item.type)
+                }.width('100%').height(14).borderRadius(7).clip(true)
+                Column({ space: 6 }) {
+                  ForEach(this.getTypeBreakdown(), (item: TypeBreakdownItem, idx: number) => {
+                    Row({ space: 6 }) {
+                      Column().width(8).height(8).borderRadius(4).backgroundColor(this.getTypeColor(idx))
+                      Text(item.type).fontSize(12).fontColor('#333').layoutWeight(1)
+                      Text(`¥${item.cost}`).fontSize(12).fontColor('#999')
+                    }.width('100%')
+                  }, (item: TypeBreakdownItem, _idx: number) => item.type)
+                }.width('100%').margin({ top: 4 })
+              }.width('100%').padding(12).backgroundColor('#F8F8FA').borderRadius(10)
+
+              // 每周花费简易柱状图
+              Column({ space: 8 }) {
+                Text('本月每周花费').fontSize(12).fontColor('#999').width('100%')
+                Row({ space: 8 }) {
+                  ForEach(this.getWeeklyCosts(), (cost: number, idx: number) => {
+                    Column({ space: 4 }) {
+                      Column()
+                        .width(20)
+                        .height(this.getMaxWeeklyCost() > 0 ? Math.max(4, (cost / this.getMaxWeeklyCost()) * 70) : 4)
+                        .backgroundColor('#FF7A45').borderRadius(4)
+                      Text(`第${idx + 1}周`).fontSize(10).fontColor('#999')
+                      Text(`¥${cost}`).fontSize(9).fontColor('#BBB')
+                    }.justifyContent(FlexAlign.End)
+                  }, (_cost: number, idx: number) => idx.toString())
+                }.width('100%').height(110).alignItems(VerticalAlign.Bottom).justifyContent(FlexAlign.SpaceAround)
+              }.width('100%').padding(12).backgroundColor('#F8F8FA').borderRadius(10)
+            } else {
+              Column({ space: 6 }) {
+                Text('这个月还没有打卡记录').fontSize(14).fontColor('#999')
+                Text('多吃多打卡，月底来看看战绩吧').fontSize(12).fontColor('#BBB')
+              }.width('100%').padding({ top: 30 })
+            }
+          }.padding(20).width('100%')
+        }.width('100%').height('100%').scrollBar(BarState.Off)
+      }.tabBar('月度报告')
     }
     .backgroundColor(Color.White).borderRadius({ topLeft: 20, topRight: 20 })
   }
+  // 保存打卡记录的逻辑方法
+  // 保存打卡记录的逻辑方法（严格遵守 ArkTS 数组操作规范）
+  saveCheckIn(waitTime: number, cost: number) {
+    if (!this.selectedShop) return;
 
+    let newRecord: CheckInRecord = {
+      id: Date.now().toString(),
+      shopName: this.selectedShop.name,
+      date: Date.now(),
+      waitTime: waitTime,
+      cost: cost,
+      shopType: this.selectedShop.type // ✅ 月度报告功能新增：记下当时的店铺类型，供"按类型分布"统计使用
+    };
+
+    // ArkTS 安全写法：直接 push 到持久化数组中
+    this.checkInRecords.push(newRecord);
+
+    // ✅ 自由流转功能新增：把这条记录也写进分布式数据库，自动同步给同账号下的其他设备
+    this.syncRecordToDistributedStore(newRecord);
+
+    try {
+      promptAction.showToast({
+        message: '打卡成功！已同步记录。',
+        duration: 2000
+      });
+    } catch (e) {
+      console.error('showToast 失败: ' + JSON.stringify(e));
+    }
+  }
+
+  // ✅ 自由流转功能新增：初始化分布式键值数据库，开启跨设备同步
+  async initDistributedSync(): Promise<void> {
+    try {
+      let atManager = abilityAccessCtrl.createAtManager();
+      let context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      // 申请"分布式数据同步"权限（与定位权限是同一套申请方式，用户允许后才能跨设备同步）
+      await atManager.requestPermissionsFromUser(context, ['ohos.permission.DISTRIBUTED_DATASYNC']);
+
+      let kvManagerConfig: distributedKVStore.KVManagerConfig = {
+        context: context,
+        bundleName: context.applicationInfo.name
+      };
+      this.kvManager = distributedKVStore.createKVManager(kvManagerConfig);
+
+      let options: distributedKVStore.Options = {
+        createIfMissing: true,
+        encrypt: false,
+        backup: false,
+        autoSync: true, // 开启自动端端同步，不需要手动调用 sync
+        kvStoreType: distributedKVStore.KVStoreType.SINGLE_VERSION,
+        securityLevel: distributedKVStore.SecurityLevel.S1
+      };
+      this.kvStore = await this.kvManager.getKVStore(this.distributedStoreId, options) as distributedKVStore.SingleKVStore;
+
+      // 订阅"其他设备"的数据变化，自动把新打卡/删除同步到本机界面上
+      this.kvStore.on('dataChange', distributedKVStore.SubscribeType.SUBSCRIBE_TYPE_REMOTE, (data: distributedKVStore.ChangeNotification) => {
+        this.handleRemoteCheckInChange(data);
+      });
+
+      // 首次连接时，把本机已有记录与分布式数据库里已有的记录做一次双向合并，避免互相覆盖丢数据
+      await this.mergeAndPushAllRecords();
+
+      this.syncStatus = '🔄 跨设备同步已开启';
+    } catch (err) {
+      console.error('打卡记录跨设备同步初始化失败: ' + JSON.stringify(err));
+      this.syncStatus = '⚪ 跨设备同步未开启（不影响本机记录）';
+    }
+  }
+
+  // ✅ 自由流转功能新增：把单条记录写入分布式数据库（静默失败，不影响本机记录的正常使用）
+  syncRecordToDistributedStore(record: CheckInRecord): void {
+    if (!this.kvStore) { return; }
+    let store = this.kvStore;
+    store.put('record:' + record.id, JSON.stringify(record)).catch((err: Error) => {
+      console.error('打卡记录同步到其他设备失败: ' + JSON.stringify(err));
+    });
+  }
+
+  // ✅ 自由流转功能新增：首次连接分布式数据库时，把"本机记录"与"远端记录"按 id 去重合并，
+  // 合并后的全量结果再整体补写回分布式数据库，确保所有设备最终看到同一份数据，谁也不会被覆盖丢失
+  async mergeAndPushAllRecords(): Promise<void> {
+    if (!this.kvStore) { return; }
+    let store = this.kvStore;
+    try {
+      let remoteEntries: distributedKVStore.Entry[] = await store.getEntries('record:');
+      let merged: CheckInRecord[] = [...this.checkInRecords];
+      remoteEntries.forEach((entry: distributedKVStore.Entry) => {
+        try {
+          let r: CheckInRecord = JSON.parse(entry.value.value as string) as CheckInRecord;
+          if (!merged.some((m: CheckInRecord) => m.id === r.id)) {
+            merged.push(r);
+          }
+        } catch (e) {
+          console.error('解析远端打卡记录失败: ' + JSON.stringify(e));
+        }
+      });
+      merged.sort((a: CheckInRecord, b: CheckInRecord) => a.date - b.date);
+      this.checkInRecords = merged;
+
+      for (let i = 0; i < this.checkInRecords.length; i++) {
+        let r = this.checkInRecords[i];
+        await store.put('record:' + r.id, JSON.stringify(r));
+      }
+    } catch (err) {
+      console.error('打卡记录跨设备首次合并失败: ' + JSON.stringify(err));
+    }
+  }
+
+  // ✅ 自由流转功能新增：收到"其他设备"的数据变化通知后，把新增/更新/删除增量应用到本机记录上
+  handleRemoteCheckInChange(data: distributedKVStore.ChangeNotification): void {
+    let updated: CheckInRecord[] = [...this.checkInRecords];
+    let changed = false;
+
+    let applyEntries = (entries: distributedKVStore.Entry[]): void => {
+      entries.forEach((entry: distributedKVStore.Entry) => {
+        try {
+          let r: CheckInRecord = JSON.parse(entry.value.value as string) as CheckInRecord;
+          let idx = updated.findIndex((m: CheckInRecord) => m.id === r.id);
+          if (idx >= 0) { updated[idx] = r; } else { updated.push(r); }
+          changed = true;
+        } catch (e) {
+          console.error('解析远端打卡变更失败: ' + JSON.stringify(e));
+        }
+      });
+    };
+    applyEntries(data.insertEntries);
+    applyEntries(data.updateEntries);
+
+    data.deleteEntries.forEach((entry: distributedKVStore.Entry) => {
+      let id = entry.key.indexOf('record:') === 0 ? entry.key.substring(7) : entry.key;
+      let before = updated.length;
+      updated = updated.filter((m: CheckInRecord) => m.id !== id);
+      if (updated.length !== before) { changed = true; }
+    });
+
+    if (changed) {
+      updated.sort((a: CheckInRecord, b: CheckInRecord) => a.date - b.date);
+      this.checkInRecords = updated;
+      try {
+        promptAction.showToast({ message: '📡 已同步到其他设备的新打卡记录', duration: 2000 });
+      } catch (e) {
+        console.error('showToast 失败: ' + JSON.stringify(e));
+      }
+    }
+  }
+
+  // ✅ 打卡功能新增：删除单条打卡记录（ArkTS 安全写法：filter 生成新数组再整体赋值，避免直接 splice 触发响应式问题）
+  deleteCheckInRecord(id: string): void {
+    this.checkInRecords = this.checkInRecords.filter((r: CheckInRecord) => r.id !== id);
+    // ✅ 自由流转功能新增：同步删除分布式数据库里的这一条，其他设备也会跟着移除
+    if (this.kvStore) {
+      let store = this.kvStore;
+      store.delete('record:' + id).catch((err: Error) => {
+        console.error('打卡记录跨设备删除失败: ' + JSON.stringify(err));
+      });
+    }
+  }
+
+  // ✅ 打卡功能新增：一键清空全部打卡记录
+  clearCheckInRecords(): void {
+    // ✅ 自由流转功能新增：先把分布式数据库里对应的每一条都删掉，避免其他设备再把旧数据同步回来
+    if (this.kvStore) {
+      let store = this.kvStore;
+      this.checkInRecords.forEach((r: CheckInRecord) => {
+        store.delete('record:' + r.id).catch((err: Error) => {
+          console.error('打卡记录跨设备清空失败: ' + JSON.stringify(err));
+        });
+      });
+    }
+    this.checkInRecords = [];
+  }
+
+  // ✅ 月度报告功能新增：取出"指定年月"内的所有打卡记录（参数化，方便同时算本月和上月）
+  getRecordsForMonth(year: number, month: number): CheckInRecord[] {
+    return this.checkInRecords.filter((r: CheckInRecord) => {
+      let d = new Date(r.date);
+      return d.getFullYear() === year && (d.getMonth() + 1) === month;
+    });
+  }
+
+  // ✅ 月度报告功能新增：汇总"指定年月"的次数 / 总花费 / 平均耗时 / 最常去的店铺
+  getSummaryForMonth(year: number, month: number): MonthSummary {
+    let records = this.getRecordsForMonth(year, month);
+    let totalCost = 0;
+    let totalWait = 0;
+    let shopCountMap: Map<string, number> = new Map();
+    records.forEach((r: CheckInRecord) => {
+      totalCost += r.cost;
+      totalWait += r.waitTime;
+      shopCountMap.set(r.shopName, (shopCountMap.get(r.shopName) || 0) + 1);
+    });
+    let topShop = '';
+    let topShopCount = 0;
+    shopCountMap.forEach((count: number, name: string) => {
+      if (count > topShopCount) { topShopCount = count; topShop = name; }
+    });
+    let summary: MonthSummary = {
+      count: records.length,
+      totalCost: totalCost,
+      avgWait: records.length > 0 ? Math.round(totalWait / records.length) : 0,
+      topShop: topShop,
+      topShopCount: topShopCount
+    };
+    return summary;
+  }
+
+  // 取出当前正在查看的月份的记录 / 汇总（内部委托给参数化版本，保持调用方式不变）
+  getMonthRecords(): CheckInRecord[] {
+    return this.getRecordsForMonth(this.reportYear, this.reportMonth);
+  }
+
+  getMonthSummary(): MonthSummary {
+    return this.getSummaryForMonth(this.reportYear, this.reportMonth);
+  }
+
+  // ✅ 月度报告功能新增：上一个月的汇总，用于"环比"对比
+  getPrevMonthSummary(): MonthSummary {
+    let prevMonth = this.reportMonth - 1;
+    let prevYear = this.reportYear;
+    if (prevMonth < 1) { prevMonth = 12; prevYear -= 1; }
+    return this.getSummaryForMonth(prevYear, prevMonth);
+  }
+
+  // ✅ 月度报告功能新增：把"本月 vs 上月"的差异拼成一句话文案
+  getMonthOverMonthText(): string {
+    let cur = this.getMonthSummary();
+    let prev = this.getPrevMonthSummary();
+    let countDiff = cur.count - prev.count;
+    let costDiff = cur.totalCost - prev.totalCost;
+    let countArrow = countDiff > 0 ? '↑' : (countDiff < 0 ? '↓' : '→');
+    let costArrow = costDiff > 0 ? '↑' : (costDiff < 0 ? '↓' : '→');
+    return `较上月：打卡 ${countArrow}${Math.abs(countDiff)}次 · 花费 ${costArrow}¥${Math.abs(costDiff)}`;
+  }
+
+  // ✅ 月度报告功能新增：本月单次消费最高的那条记录的店铺名 / 金额
+  getMaxSingleCostShopName(): string {
+    let records = this.getMonthRecords();
+    if (records.length === 0) { return ''; }
+    let max = records[0];
+    records.forEach((r: CheckInRecord) => { if (r.cost > max.cost) { max = r; } });
+    return max.shopName;
+  }
+
+  getMaxSingleCost(): number {
+    let records = this.getMonthRecords();
+    if (records.length === 0) { return 0; }
+    let max = records[0];
+    records.forEach((r: CheckInRecord) => { if (r.cost > max.cost) { max = r; } });
+    return max.cost;
+  }
+
+  // ✅ 月度报告功能新增：按店铺类型（吃食堂/出去吃/点外卖/吃泡面）汇总当月花费分布，按花费从高到低排序
+  getTypeBreakdown(): TypeBreakdownItem[] {
+    let records = this.getMonthRecords();
+    let map: Map<string, number> = new Map();
+    records.forEach((r: CheckInRecord) => {
+      let type = r.shopType || '未知';
+      map.set(type, (map.get(type) || 0) + r.cost);
+    });
+    let result: TypeBreakdownItem[] = [];
+    map.forEach((cost: number, type: string) => {
+      result.push({ type: type, cost: cost });
+    });
+    result.sort((a: TypeBreakdownItem, b: TypeBreakdownItem) => b.cost - a.cost);
+    return result;
+  }
+
+  // ✅ 月度报告功能新增：给"按类型分布"的色块按顺序配色
+  getTypeColor(idx: number): string {
+    let colors: string[] = ['#FF7A45', '#FFD666', '#36CFC9', '#9254DE', '#F759AB'];
+    return colors[idx % colors.length];
+  }
+
+  // ✅ 月度报告功能新增：按"第几周"汇总当月花费，用于简易柱状图（最多按 5 周划分）
+  getWeeklyCosts(): number[] {
+    let records = this.getMonthRecords();
+    let weeks: number[] = [0, 0, 0, 0, 0];
+    records.forEach((r: CheckInRecord) => {
+      let day = new Date(r.date).getDate();
+      let weekIndex = Math.min(4, Math.floor((day - 1) / 7));
+      weeks[weekIndex] += r.cost;
+    });
+    return weeks;
+  }
+
+  // ✅ 月度报告功能新增：取当月每周花费里的最大值，用于计算柱状图的相对高度
+  getMaxWeeklyCost(): number {
+    let weeks = this.getWeeklyCosts();
+    let max = 0;
+    weeks.forEach((w: number) => { if (w > max) { max = w; } });
+    return max;
+  }
+
+  // ✅ 月度报告功能新增：切换报告月份（delta 为 -1 上一月 / +1 下一月），自动处理跨年
+  shiftReportMonth(delta: number): void {
+    let newMonth = this.reportMonth + delta;
+    let newYear = this.reportYear;
+    if (newMonth > 12) { newMonth = 1; newYear += 1; }
+    if (newMonth < 1) { newMonth = 12; newYear -= 1; }
+    this.reportYear = newYear;
+    this.reportMonth = newMonth;
+  }
+
+  // ✅ 月度报告功能新增：判断当前查看的月份是否已经是本月（用于禁用"下一月"按钮，不能查看未来）
+  isCurrentOrFutureMonth(): boolean {
+    let now = new Date();
+    if (this.reportYear > now.getFullYear()) { return true; }
+    if (this.reportYear === now.getFullYear() && this.reportMonth >= (now.getMonth() + 1)) { return true; }
+    return false;
+  }
+
+  @StorageLink('checkInRecords') checkInRecords: CheckInRecord[] = [];
   build() {
     GridRow({
       breakpoints: { value: ['320vp', '600vp', '840vp'] }
@@ -614,8 +1237,8 @@ struct Index {
       GridCol({ span: 12 }) {
         if (this.currentBreakpoint === 'xs' || this.currentBreakpoint === 'sm') {
           Column() {
-            Column() { this.MagazineDashboard() }.width('100%').layoutWeight(1).clip(true)
-            Column() { this.DataGridPanel() }.width('100%').layoutWeight(1).clip(true)
+            Column() { this.MagazineDashboard() }.width('100%').layoutWeight(this.topPanelWeight).clip(true)
+            Column() { this.DataGridPanel() }.width('100%').layoutWeight(this.bottomPanelWeight).clip(true)
           }.width('100%').height('100%')
         } else {
           Row() {
